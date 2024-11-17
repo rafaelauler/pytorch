@@ -1060,7 +1060,7 @@ class _ModuleFrame:
         elif self.module_call_graph.get(self.fqn) is not None:
             # x is an ival that is not in placeholders, so create a
             # get_attr node corresponding to attribute __ival__x
-            return self.ivals.read(self.fqn, self.graph, x)
+            return self.ivals.read(self.fqn, self.graph, x)  # type:ignore[union-attr]
         else:
             raise RuntimeError(
                 f"Could not run remap_input() on op type: {x.op} for node {x}"
