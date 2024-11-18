@@ -924,8 +924,8 @@ ScalingType get_scaling_type(
       scale_b.dim());
 
   // Check for RowWise scaling
-  if (scale_a.size(0) == dim_m && scale_a.size(1) == 1 &&
-      scale_b.size(0) == 1 && scale_b.size(1) == dim_n) {
+  if (scale_a.size(0) == dim_m && scale_a.size(1) <= 1 &&
+      scale_b.size(0) <= 1 && scale_b.size(1) == dim_n) {
 #if !defined(USE_ROCM) && !defined(_MSC_VER) || \
     (defined(USE_ROCM) && ROCM_VERSION >= 60000)
     TORCH_CHECK(
@@ -944,7 +944,7 @@ ScalingType get_scaling_type(
       "Invalid scaling configuration. For TensorWise scaling, both scales should be scalar. "
       "For RowWise scaling, scale_a should be (",
       dim_m,
-      ", 1) and scale_b should be (1, ",
+      ", (1 or 0)) and scale_b should be ((1 or 0), ",
       dim_n,
       "). "
       "Got scale_a.size()=(",
@@ -1049,6 +1049,19 @@ _scaled_mm_out_cuda(const Tensor& mat1, const Tensor& mat2,
   IntArrayRef mat1_sizes = mat1.sizes();
   IntArrayRef mat2_sizes = mat2.sizes();
   at::native::resize_output(out, {mat1_sizes[0], mat2_sizes[1]});
+
+  // If any of M, K, N is 0 - return early (the tensorwise/rowwise float8 gemm kernels
+  // do not support this case).
+  if (mat1_sizes[0] == 0 || mat1_sizes[1] == 0 || mat2_sizes[1] == 0) {
+    // `out` was created with `at::empty`. In the case where we are multiplying
+    // MxK by KxN and K is the zero dim, we need to initialize here to properly
+    // return a tensor of zeros.
+    if (mat1_sizes[1] == 0) {
+      out.zero_();
+    }
+
+    return out;
+  }
 
   // We are doing row-wise scaling
   if (scaling_choice == ScalingType::RowWise) {

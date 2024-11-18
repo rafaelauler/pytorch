@@ -5581,13 +5581,16 @@ def meta_scaled_mm(
         def is_col_major(stride):
             return stride[0] == 1 and stride[1] > 1
 
+        def has_zero_dim(tensor_2d):
+            return tensor_2d.size(0) == 0 or tensor_2d.size(1) == 0
+
         torch._check(
-            is_row_major(self.stride()),
-            lambda: "self must be row_major",
+            is_row_major(self.stride()) or has_zero_dim(self),
+            lambda: f"self must be row_major, got stride {self.stride()}",
         )
         torch._check(
-            is_col_major(mat2.stride()),
-            lambda: "mat2 must be col_major",
+            is_col_major(mat2.stride()) or has_zero_dim(mat2),
+            lambda: f"mat2 must be col_major, got stride {mat2.stride()}",
         )
         torch._check(
             self.size(1) % 16 == 0,
@@ -5617,8 +5620,8 @@ def meta_scaled_mm(
 
             if (
                 scale_a.size(0) == m
-                and scale_a.size(1) == 1
-                and scale_b.size(0) == 1
+                and scale_a.size(1) in (1, 0)
+                and scale_b.size(0) in (1, 0)
                 and scale_b.size(1) == n
             ):
                 # rowwise scaling
@@ -5633,7 +5636,7 @@ def meta_scaled_mm(
                     lambda: (
                         "Invalid scaling configuration. "
                         "For tensorwise scaling, both scales should be scalar. "
-                        f"For rowwise scaling, scale_a should be ({m}, 1), scale_b should be (1, {n}). "
+                        f"For rowwise scaling, scale_a should be ({m}, 1) or ({m}, 0), scale_b should be (1, {n}) or (0, {n}). "
                         f"Got scale_a.size()=({scale_a.size(0)}, {scale_a.size(1)}) "
                         f"and scale_b.size()=({scale_b.size(0)}, {scale_b.size(1)})"
                     ),
