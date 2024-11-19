@@ -84,6 +84,19 @@ PYTORCH_EXTRA_INSTALL_REQUIREMENTS = {
         "nvidia-nvtx-cu12==12.6.77; platform_system == 'Linux' and platform_machine == 'x86_64' | "
         "nvidia-nvjitlink-cu12==12.6.77; platform_system == 'Linux' and platform_machine == 'x86_64'"
     ),
+    "xpu": (
+        "dpcpp-cpp-rt==2025.0.2; platform_machine == 'x86_64' | "
+        "intel-cmplr-lib-rt==2025.0.2; platform_machine == 'x86_64' | "
+        "intel-cmplr-lib-ur==2025.0.2; platform_machine == 'x86_64' | "
+        "intel-cmplr-lic-rt==2025.0.2; platform_machine == 'x86_64' | "
+        "intel-opencl-rt==2025.0.2; platform_machine == 'x86_64' | "
+        "intel-sycl-rt==2025.0.2; platform_machine == 'x86_64' | "
+        "intel-openmp==2025.0.2; platform_machine == 'x86_64' | "
+        "tcmlib==1.2.0; platform_machine == 'x86_64' | "
+        "umf==0.9.1; platform_machine == 'x86_64' | "
+        "tbb==2022.0.0; platform_machine == 'x86_64' | "
+        "intel-pti==0.10.0; platform_system == 'Linux' and platform_machine == 'x86_64' | "
+    ),
 }
 
 
@@ -483,8 +496,10 @@ def generate_wheels_matrix(
                             ".", "_"
                         ),
                         "pytorch_extra_install_requirements": (
-                            PYTORCH_EXTRA_INSTALL_REQUIREMENTS["12.4"]
-                            if os != "linux" and gpu_arch_type != "xpu"
+                            PYTORCH_EXTRA_INSTALL_REQUIREMENTS["xpu"]
+                            if gpu_arch_type == "xpu"
+                            else PYTORCH_EXTRA_INSTALL_REQUIREMENTS["12.4"]
+                            if os != "linux"
                             else ""
                         ),
                     }
