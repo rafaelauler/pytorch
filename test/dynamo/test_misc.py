@@ -9113,26 +9113,26 @@ def ___make_guard_fn():
 
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_validate_outputs_unbacked(self):
-        class SillyCat(torch.autograd.Function):
-            @staticmethod
-            def forward(ctx, x0, x1, i):
-                ctx.save_for_backward(i)
-                return torch.cat([x0, x1])
+        with torch.library._scoped_library("mylib", "FRAGMENT") as lib:
+            torch.library.define(
+                "mylib::foo",
+                "(Tensor a, Tensor b) -> (Tensor)",
+                tags=torch.Tag.pt2_compliant_tag,
+                lib=lib,
+            )
 
-            @staticmethod
-            def backward(ctx, grad_out):
-                (i,) = ctx.saved_tensors
+            @torch.library.impl("mylib::foo", "cpu", lib=lib)
+            @torch.library.register_fake("mylib::foo")
+            def foo_impl(x, y):
+                return torch.cat([x, y])
+
+            @torch.compile(backend="aot_eager", fullgraph=True)
+            def f(x, i):
                 i0, i1 = i.tolist()
-                g_x0, g_x1 = grad_out.split([i0, i1])
-                return g_x0, g_x1, None
+                x0, x1 = x.split([i0, i1])
+                return torch.ops.mylib.foo(x0, x1)
 
-        @torch.compile(backend="aot_eager", fullgraph=True)
-        def f(x, i):
-            i0, i1 = i.tolist()
-            x0, x1 = x.split([i0, i1])
-            return SillyCat.apply(x0, x1, i)
-
-        f(torch.randn(9, requires_grad=True), torch.tensor([3, 6]))
+            f(torch.randn(9, requires_grad=True), torch.tensor([3, 6]))
 
     def test_str_format_assert1(self):
         @torch.compile(backend="eager", fullgraph=True)
