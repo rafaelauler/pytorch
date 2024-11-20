@@ -255,7 +255,7 @@ class ConstantValue(_Union):
 
 
 @dataclass
-class ConstantInputSpec:
+class InputToConstantInputSpec:
     name: str
     value: ConstantValue
 
@@ -299,7 +299,7 @@ class InputSpec(_Union):
     tensor_constant: InputToTensorConstantSpec
     custom_obj: InputToCustomObjSpec
     token: InputTokenSpec
-    constant_input: ConstantInputSpec
+    constant_input: InputToConstantInputSpec
 
 
 @dataclass
