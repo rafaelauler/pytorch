@@ -368,6 +368,9 @@ class BaseSchedulerNode:
 
     def is_reduction(self) -> bool:
         return False
+    
+    def is_defer_split_reduction(self) -> bool:
+        return False
 
     def is_split_scan(self) -> bool:
         return False
@@ -765,6 +768,9 @@ class OutputNode:
 
     def is_reduction(self) -> bool:
         return False
+    
+    def is_defer_split_reduction(self) -> bool:
+        return False
 
     def get_inputs_that_alias_output(self) -> Sequence[str]:
         return ()
@@ -981,6 +987,15 @@ class SchedulerNode(BaseSchedulerNode):
             self.node, (ir.ComputedBuffer, ir.TemplateBuffer)
         ), f"{type(self.node)=}"
         return bool(self.node.get_reduction_type())
+    
+    def is_defer_split_reduction(self) -> bool:
+        from .runtime.hints import ReductionHint
+        if isinstance(self.node, ir.ComputedBuffer) and isinstance(self.node.data, ir.Reduction):
+            ret = self.node.data.reduction_hint == ReductionHint.DEFERRED_SPLIT
+            if ret:
+                assert config.defer_reduction_split, "ReductionHint.DEFERRED_SPLIT should only appear when defer_reduction_split is enabled"
+            return ret
+        return False
 
     def is_split_scan(self) -> bool:
         assert isinstance(
@@ -1831,6 +1846,13 @@ class Scheduler:
         if config._pre_fusion_custom_pass is not None:
             self.nodes = config._pre_fusion_custom_pass(self.nodes)
         self.nodes = self.fuse_nodes(self.nodes)
+
+        if config.defer_reduction_split:
+            has_new_split_nodes = self.split_reduction_node()
+            # Fuse again if there are new reduction nodes
+            if has_new_split_nodes:
+                self.nodes = self.fuse_nodes(self.nodes)
+
         if config.reorder_for_peak_memory:
             from .memory import reorder_for_peak_memory
 
@@ -1902,6 +1924,114 @@ class Scheduler:
         else:
             raise NotImplementedError(node)
 
+    def split_reduction_node(self):
+        has_new_nodes = False
+
+        def split_reduction_single_node(idx, snode, all_nodes):
+            split_hints = []
+            for other_node in all_nodes:
+                if other_node is snode:
+                    continue
+                if other_node.is_template():
+                    continue
+                if isinstance(other_node, (GroupedSchedulerNode, ExternKernelSchedulerNode, NopKernelSchedulerNode)):
+                    continue
+                if snode.get_device() != other_node.get_device():
+                    continue
+
+                shared_data_score = self.score_fusion_memory(snode, other_node)
+                if shared_data_score < config.score_fusion_memory_threshold:
+                    shared_data_score = self.shared_data_after_reordering_loop(snode, other_node)
+                if shared_data_score >= config.score_fusion_memory_threshold:
+                    _, (numel1, rnumel1) = other_node.group
+                    from .codegen.simd import SIMDScheduling
+                    tiling = SIMDScheduling.select_tiling(other_node.get_nodes(), numel1, rnumel1)
+                    split_hints.append(tiling[0])
+
+            orig_num_nodes = len(V.graph.operations)
+            orig_buffer = snode.node
+            orig_node = orig_buffer.data
+
+            new_node = ir.Reduction.create(
+                device=orig_node.device,
+                dst_dtype=orig_node.dtype,
+                src_dtype=orig_node.dtype,
+                inner_fn=orig_node.inner_fn,
+                ranges=orig_node.ranges,
+                reduction_ranges=orig_node.reduction_ranges,
+                reduction_type=orig_node.reduction_type,
+                # reduction_hint=orig_node.reduction_hint, # Use default value
+                input_node=orig_node.input_node,
+                ignore_defer_reduction_split=True,
+                split_hints=split_hints,
+            )
+
+            new_node_name = new_node.realize()
+            new_buffer = V.graph.name_to_buffer[new_node_name]
+            self.replace_operation_buffer(orig_buffer, new_buffer)
+
+            # After creating the Reduction node, its layout is fixed by https://fburl.com/code/dktn7cdo
+            # Is it enough to simply call .as_fixed() on all new reduction nodes?
+            new_buffer.layout = new_buffer.layout.as_fixed()
+            for i in range(orig_num_nodes, len(V.graph.operations)):
+                middle_buffer = V.graph.operations[i]
+                middle_buffer.layout = middle_buffer.layout.as_fixed()
+
+            # Add the new reduction nodes to the scheduler
+            new_scheduler_node = self.create_scheduler_node(new_buffer)
+            self.nodes[idx] = new_scheduler_node
+            self.name_to_node[snode.get_name()] = new_scheduler_node
+            self.name_to_fused_node[snode.get_name()] = new_scheduler_node
+
+            for new_out, old_out in zip(
+                new_scheduler_node.get_outputs(), snode.get_outputs()
+            ):
+                self.name_to_buf[old_out.get_name()] = new_out
+                new_out.users = old_out.users
+
+            new_scheduler_node.min_order = snode.min_order
+            new_scheduler_node.max_order = snode.max_order
+            new_scheduler_node.last_usage = snode.last_usage
+
+            # It's possible that there is no additional middle-layer nodes
+            if len(V.graph.operations) == orig_num_nodes:
+                return
+
+            # Create SchedulerNodes for middle-layer reduction nodes
+            orig_num_scheduler_node = len(self.nodes)
+            for i in range(orig_num_nodes, len(V.graph.operations)):
+                middle_buffer = V.graph.operations[i]
+                middle_buffer.layout = middle_buffer.layout.as_fixed()
+                middle_node = self.create_scheduler_node(middle_buffer)
+                self.nodes.append(middle_node)
+                self.name_to_node[middle_node.get_name()] = middle_node
+                self.name_to_buf.update({
+                    buf.get_name() : buf for buf in middle_node.get_outputs()
+                })
+                self.name_to_fused_node[middle_node.get_name()] = middle_node
+
+            # The node whose users are the orig_node (un-split reduction) should be updated to be the first middle reduction node
+            for node in self.nodes:
+                for buf in node.get_outputs():
+                    for user in buf.users:
+                        if user.node.get_name() == snode.get_name():
+                            user.node = self.nodes[orig_num_scheduler_node]
+            # Update the dependencies (buf.usesrs) of the new reduction nodes
+            self.compute_dependencies(self.nodes[orig_num_scheduler_node:]+[new_scheduler_node])
+
+        snodes = self.nodes
+        for idx in range(len(snodes)):
+            s = snodes[idx]
+            if s.is_defer_split_reduction():
+                split_reduction_single_node(idx, s, snodes)
+                has_new_nodes = True
+
+        if has_new_nodes:
+            self.nodes = self.topological_sort_schedule(self.nodes)
+            self.compute_ancestors()
+
+        return has_new_nodes
+
     def create_foreach_nodes(self) -> None:
         removed_node_names: OrderedSet[str] = OrderedSet()
         fe_nodes = []
@@ -1938,7 +2068,7 @@ class Scheduler:
             node for node in self.nodes if node.get_name() not in removed_node_names
         ] + list(fe_nodes)
 
-    def compute_dependencies(self) -> None:
+    def compute_dependencies(self, snodes = None) -> None:
         """
         Create dependency edges between nodes, handling aliasing and
         mutation properly.
@@ -1946,6 +2076,9 @@ class Scheduler:
 
         T = TypeVar("T")
 
+        if snodes is None:
+            snodes = self.nodes
+        
         class DedupList(Generic[T]):
             """
             This data structure behaves like a list except it makes sure the
@@ -1984,7 +2117,7 @@ class Scheduler:
         # handle aliasing by using python aliasing in name_to_users
         # if foo aliases bar then we will make name_to_users["foo"] point
         # to the same python list as name_to_users["bar"]
-        for node in self.nodes:
+        for node in snodes:
             for buf1 in node.get_outputs():
                 buf1_name = buf1.get_name()
                 for buf2_name in buf1.get_aliases():
@@ -2029,7 +2162,7 @@ class Scheduler:
                 for fs in val.free_symbols:
                     unbacked_symbol_to_origin_node[fs] = None
 
-        for node in self.nodes:
+        for node in snodes:
             log.debug("scheduling %s", node.node)
 
             # unbacked symbols don't follow ordinary buffer dependencies, so
@@ -2140,7 +2273,7 @@ class Scheduler:
         ]
 
         # copy users information onto the nodes
-        for node in self.nodes:
+        for node in snodes:
             for buf in node.get_outputs():
                 buf.set_users(name_to_users[buf.get_name()].items)
 
@@ -2362,35 +2495,35 @@ class Scheduler:
         backend = self.get_backend(device)
         with dynamo_timed("benchmark_fused_nodes"):
             return backend.benchmark_fused_nodes(nodes)
+    
+    def replace_operation_buffer(
+        self, orig_node: ir.OperationBuffer, new_node: ir.OperationBuffer
+    ) -> None:
+        replaced_buf_name = new_node.get_name()
+        orig_buf_name = orig_node.get_name()
+        assert isinstance(orig_buf_name, str) and isinstance(replaced_buf_name, str)
+
+        replaced_op_name = new_node.get_operation_name()
+        orig_op_name = orig_node.get_operation_name()
+        assert isinstance(orig_op_name, str) and isinstance(replaced_op_name, str)
+
+        del V.graph.name_to_buffer[replaced_buf_name]
+        new_node.name = orig_buf_name
+
+        del V.graph.name_to_op[replaced_op_name]
+        new_node.operation_name = orig_op_name
+
+        orig = V.graph.buffers.index(orig_node)
+        V.graph.buffers.remove(new_node)
+        V.graph.buffers[orig] = new_node
+        V.graph.name_to_buffer[orig_buf_name] = new_node
+
+        orig = V.graph.operations.index(orig_node)
+        V.graph.operations.remove(new_node)
+        V.graph.operations[orig] = new_node
+        V.graph.name_to_op[orig_op_name] = new_node
 
     def finalize_multi_template_buffers(self) -> None:
-        def replace_operation_buffer(
-            orig_node: ir.MultiTemplateBuffer, new_node: ir.OperationBuffer
-        ) -> None:
-            replaced_buf_name = new_node.get_name()
-            orig_buf_name = orig_node.get_name()
-            assert isinstance(orig_buf_name, str) and isinstance(replaced_buf_name, str)
-
-            replaced_op_name = new_node.get_operation_name()
-            orig_op_name = orig_node.get_operation_name()
-            assert isinstance(orig_op_name, str) and isinstance(replaced_op_name, str)
-
-            del V.graph.name_to_buffer[replaced_buf_name]
-            new_node.name = orig_buf_name
-
-            del V.graph.name_to_op[replaced_op_name]
-            new_node.operation_name = orig_op_name
-
-            orig = V.graph.buffers.index(orig_node)
-            V.graph.buffers.remove(new_node)
-            V.graph.buffers[orig] = new_node
-            V.graph.name_to_buffer[orig_buf_name] = new_node
-
-            orig = V.graph.operations.index(orig_node)
-            V.graph.operations.remove(new_node)
-            V.graph.operations[orig] = new_node
-            V.graph.name_to_op[orig_op_name] = new_node
-
         for i, node in enumerate(self.nodes):
             if isinstance(node, SchedulerNode) and isinstance(
                 node.node, ir.MultiTemplateBuffer
@@ -2426,7 +2559,7 @@ class Scheduler:
                 assert isinstance(out_buffer, ir.OperationBuffer)
 
                 out_buffer.layout = multi_node.layout
-                replace_operation_buffer(multi_node, out_buffer)
+                self.replace_operation_buffer(multi_node, out_buffer)
                 new_scheduler_node = self.create_scheduler_node(out_buffer)
 
                 self.nodes[i] = new_scheduler_node
@@ -3023,6 +3156,10 @@ class Scheduler:
         if node1 is node2:
             return False
 
+        # Skip fusion for nodes that are marked as defer_split_reduction, they will be split and fused later
+        if node1.is_defer_split_reduction() or node2.is_defer_split_reduction():
+            return False
+
         why = WhyNoFuse(node1, node2)
 
         if isinstance(node1, GroupedSchedulerNode) or isinstance(
@@ -3072,14 +3209,23 @@ class Scheduler:
         del device2
 
         shared_data_score = self.score_fusion_memory(node1, node2)
-        if shared_data_score == 0:
-            shared_data_score = self.shared_data_after_reordering_loop(node1, node2)
-
         loop_ordering_log.debug(
-            "%s and %s has%s shared data",
+            "%s and %s has%s shared data before loop reordering: %d",
             node1.get_name(),
             node2.get_name(),
             " no" if shared_data_score == 0 else "",
+            shared_data_score,
+        )
+
+        if shared_data_score < config.score_fusion_memory_threshold:
+            shared_data_score = self.shared_data_after_reordering_loop(node1, node2)
+
+        loop_ordering_log.debug(
+            "%s and %s has%s shared data: %d",
+            node1.get_name(),
+            node2.get_name(),
+            " no" if shared_data_score == 0 else "",
+            shared_data_score,
         )
         if shared_data_score == 0 and (
             not config.aggressive_fusion or node1.is_reduction() or node2.is_reduction()
@@ -3318,7 +3464,7 @@ class Scheduler:
         node2_dep_len = len(node1.read_writes.reads) + len(node2.read_writes.writes)
 
         # optimization: iter over smaller set
-        if max(node1_dep_len, node2_dep_len) * 4 > min(node1_dep_len, node2_dep_len):
+        if min(node1_dep_len, node2_dep_len) * 4 < max(node1_dep_len, node2_dep_len):
             if node1_dep_len > node2_dep_len:
                 tmp = node1
                 node1 = node2

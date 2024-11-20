@@ -21,6 +21,7 @@ class ReductionHint(Enum):
     OUTER = 1
     OUTER_TINY = 2
     DEFAULT = 3
+    DEFERRED_SPLIT = 4
 
 
 class TileHint(Enum):
