@@ -73,6 +73,15 @@ class TestMetricsContext(TestCase):
 
         self.assertEqual(self.metrics, {"m1": 1, "m2": 2})
 
+    def test_set_key_value(self):
+        with MetricsContext(self._on_exit) as context:
+            context.set_key_value("feature_usage", "k", True)
+            # Overrides allowed
+            context.set_key_value("feature_usage", "k2", True)
+            context.set_key_value("feature_usage", "k2", False)
+
+        self.assertEqual(self.metrics, {"feature_usage": {"k": True, "k2": False}})
+
 
 if __name__ == "__main__":
     run_tests()
