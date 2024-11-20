@@ -41,6 +41,15 @@ ReductionType = Literal[
 ]
 
 
+def is_rounding_reduction(reduction_type: ReductionType) -> bool:
+    return reduction_type in [
+        "welford_reduce",
+        "welford_combine",
+        "prod",
+        "sum",
+    ]
+
+
 def _arg_str(a) -> str:
     if isinstance(a, sympy.Expr):
         return sympy_str(a)
