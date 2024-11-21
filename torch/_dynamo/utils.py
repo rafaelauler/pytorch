@@ -864,6 +864,12 @@ class CompilationMetrics:
     joint_graph_pass_time_us: Optional[int] = None
     log_format_version: int = LOG_FORMAT_VERSION
     inductor_config: Optional[str] = None
+    remote_cache_version: Optional[int] = None
+    inductor_fx_remote_cache_hit_count: Optional[int] = None
+    inductor_fx_remote_cache_miss_count: Optional[int] = None
+    inductor_fx_remote_cache_backend_type: Optional[str] = None
+    inductor_fx_remote_cache_hit_keys: Optional[str] = None
+    inductor_fx_remote_cache_miss_keys: Optional[str] = None
 
 
 DEFAULT_COMPILATION_METRICS_LIMIT = 64
@@ -961,8 +967,29 @@ def record_compilation_metrics(metrics: Dict[str, Any]):
         metric = metrics.get(field, None)
         return metric // 1000 if metric is not None else None
 
+    def _convert_collection_to_str(field: str) -> Optional[str]:
+        def safe_str(item: Any) -> str:
+            try:
+                return str(item)
+            except Exception:
+                return str(None)
+
+        metric = metrics.get(field, None)
+        if metric is None:
+            return None
+        del metrics[field]
+        if not isinstance(metric, set) and not isinstance(metric, list):
+            return None
+        return ",".join(safe_str(item) for item in metric)
+
+    # Convert sets to strings
+    inductor_fx_remote_cache_hit_keys_str = _convert_collection_to_str("inductor_fx_remote_cache_hit_keys")
+    inductor_fx_remote_cache_miss_keys_str = _convert_collection_to_str("inductor_fx_remote_cache_miss_keys")
+
     common_metrics = {
         "inductor_config": _scrubbed_inductor_config_for_logging(),
+        "inductor_fx_remote_cache_hit_keys": inductor_fx_remote_cache_hit_keys_str,
+        "inductor_fx_remote_cache_miss_keys": inductor_fx_remote_cache_miss_keys_str,
         # -------- Any future common metircs go here --------
         #
         # Legacy metircs go here(TODO: Temporary; populate legacy fields from their replacements.)
